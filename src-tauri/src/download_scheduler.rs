@@ -13,7 +13,9 @@ use crate::protocols::traits::{DownloadOptions, ProtocolHandler};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+
 
 /// Represents a scheduled download task
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,13 +54,20 @@ pub enum DownloadTaskStatus {
 /// Download scheduler that manages tasks with different source types
 pub struct DownloadScheduler {
     tasks: HashMap<String, DownloadTask>,
+    p2p_handler: Option<Arc<dyn ProtocolHandler>>,
 }
 
 impl DownloadScheduler {
     pub fn new() -> Self {
         Self {
             tasks: HashMap::new(),
+            p2p_handler: None,
         }
+    }
+
+    /// Set the P2P protocol handler
+    pub fn set_p2p_handler(&mut self, handler: Arc<dyn ProtocolHandler>) {
+        self.p2p_handler = Some(handler);
     }
 
     /// Add a new download task with multiple sources
@@ -150,8 +159,52 @@ impl DownloadScheduler {
             protocol = ?info.protocol,
             "Initiating P2P download"
         );
-        // TODO: Implement actual P2P download logic
-        Ok(())
+
+        if let Some(handler) = &self.p2p_handler {
+            // Get task to determine output path
+            let task = self
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| format!("Task not found: {}", task_id))?;
+
+            // Construct output path
+            let file_name = &task.file_name;
+            let output_path = PathBuf::from(format!("./downloads/{}", file_name));
+
+            // Create downloads directory if it doesn't exist
+            if let Some(parent) = output_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create download directory: {}", e))?;
+            }
+
+            let options = DownloadOptions {
+                output_path,
+                max_peers: None,
+                chunk_size: None,
+                encryption: info.supports_encryption,
+                bandwidth_limit: None,
+            };
+
+            let file_hash = task.file_hash.clone();
+            let handler = handler.clone();
+
+            // Spawn async task to handle the download via the protocol handler
+            tokio::spawn(async move {
+                match handler.download(&file_hash, options).await {
+                    Ok(handle) => {
+                        info!("Started P2P download: {}", handle.identifier);
+                    }
+                    Err(e) => {
+                        error!("Failed to start P2P download: {}", e);
+                    }
+                }
+            });
+
+            Ok(())
+        } else {
+            warn!("P2P handler not configured");
+            Err("P2P handler not configured".to_string())
+        }
     }
 
     fn handle_http_download(&self, task_id: &str, info: &HttpSourceInfo) -> Result<(), String> {
@@ -560,5 +613,76 @@ mod tests {
         assert_eq!(ftp_source.display_name(), "FTP: files.example.org");
         assert!(ftp_source.supports_encryption()); // FTPS enabled
         assert_eq!(ftp_source.priority_score(), 25);
+    }
+
+    // Mock for testing
+    struct MockProtocolHandler {
+        download_called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl MockProtocolHandler {
+        fn new() -> Self {
+            Self {
+                download_called: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::protocols::traits::ProtocolHandler for MockProtocolHandler {
+        fn name(&self) -> &'static str { "mock" }
+        fn supports(&self, _id: &str) -> bool { true }
+        async fn download(&self, _id: &str, _opts: crate::protocols::traits::DownloadOptions) -> Result<crate::protocols::traits::DownloadHandle, crate::protocols::traits::ProtocolError> {
+            self.download_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::protocols::traits::DownloadHandle {
+                identifier: "mock_handle".to_string(),
+                protocol: "mock".to_string(),
+                started_at: 0,
+            })
+        }
+        async fn seed(&self, _path: PathBuf, _opts: crate::protocols::traits::SeedOptions) -> Result<crate::protocols::traits::SeedingInfo, crate::protocols::traits::ProtocolError> { Err(crate::protocols::traits::ProtocolError::NotSupported) }
+        async fn stop_seeding(&self, _id: &str) -> Result<(), crate::protocols::traits::ProtocolError> { Ok(()) }
+        async fn pause_download(&self, _id: &str) -> Result<(), crate::protocols::traits::ProtocolError> { Ok(()) }
+        async fn resume_download(&self, _id: &str) -> Result<(), crate::protocols::traits::ProtocolError> { Ok(()) }
+        async fn cancel_download(&self, _id: &str) -> Result<(), crate::protocols::traits::ProtocolError> { Ok(()) }
+        async fn get_download_progress(&self, _id: &str) -> Result<crate::protocols::traits::DownloadProgress, crate::protocols::traits::ProtocolError> { Err(crate::protocols::traits::ProtocolError::NotSupported) }
+        async fn list_seeding(&self) -> Result<Vec<crate::protocols::traits::SeedingInfo>, crate::protocols::traits::ProtocolError> { Ok(vec![]) }
+    }
+
+    #[tokio::test]
+    async fn test_p2p_download_delegation() {
+        let mut scheduler = DownloadScheduler::new();
+        let mock_handler = std::sync::Arc::new(MockProtocolHandler::new());
+        let called_flag = mock_handler.download_called.clone();
+        
+        scheduler.set_p2p_handler(mock_handler);
+
+        let task = DownloadTask {
+            task_id: "task_p2p".to_string(),
+            file_hash: "QmTestP2P".to_string(),
+            file_name: "test_p2p.bin".to_string(),
+            sources: vec![
+                DownloadSource::P2p(P2pSourceInfo {
+                    peer_id: "Peer1".to_string(),
+                    multiaddr: None,
+                    reputation: None,
+                    supports_encryption: false,
+                    protocol: None,
+                }),
+            ],
+            status: DownloadTaskStatus::Pending,
+            priority: 100,
+        };
+        scheduler.add_task(task);
+
+        let source = scheduler.select_best_source("task_p2p").unwrap();
+        let result = scheduler.start_download("task_p2p", &source);
+        
+        assert!(result.is_ok());
+        
+        // Give async task time to run
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        
+        assert!(called_flag.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
